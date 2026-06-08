@@ -1,0 +1,9 @@
+{
+  "name": "warp-codex",
+  "port": 7682,
+  "title": "warp-codex codex",
+  "tmux_session": "warp-codex",
+  "workdir": "/home/example/Source/Repo/warp",
+  "index_port": 7680
+}
+
