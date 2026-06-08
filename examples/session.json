@@ -4,6 +4,18 @@
   "title": "warp-codex codex",
   "tmux_session": "warp-codex",
   "workdir": "/home/example/Source/Repo/warp",
-  "index_port": 7680
+  "index_port": 7680,
+  "mode": "cloudflare",
+  "ttyd_bind_host": "127.0.0.1",
+  "api_bind_host": "127.0.0.1",
+  "proxy_enabled": true,
+  "proxy_port": 8781,
+  "proxy_bind_host": "127.0.0.1",
+  "api_base": "origin",
+  "public_url": "https://phonecodex.example.com",
+  "auth_username": "phonecodex",
+  "auth_password_hash": "<sha256-password-hash>",
+  "cloudflare_tunnel": "phonecodex",
+  "cloudflare_hostname": "phonecodex.example.com",
+  "cloudflare_config": "/home/example/.cloudflared/config.yml"
 }
-

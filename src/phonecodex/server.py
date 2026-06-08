@@ -13,7 +13,7 @@ from .config import (
     SessionConfig,
     all_sessions,
     default_bind_host,
-    display_host,
+    display_host_for_session,
     find_session_by_port,
     read_session,
 )
@@ -53,14 +53,18 @@ def tmux_session_exists(name: str) -> bool:
     return result.returncode == 0
 
 
+def tmux_target(name: str) -> str:
+    return f"{name}:0.0"
+
+
 def tmux_send_key(name: str, key: str) -> None:
     mapped = KEY_MAP.get(key)
     if mapped is None:
         raise ValueError("unsupported key")
-    subprocess.run(["tmux", "send-keys", "-t", name, mapped], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), mapped], check=True)
 
 
-def tmux_paste_text(name: str, text: str, submit: bool = False) -> None:
+def tmux_paste_buffer(name: str, text: str, submit: bool = False) -> None:
     encoded = text.encode("utf-8")
     if len(encoded) > MAX_PASTE_BYTES:
         raise ValueError("paste is too large")
@@ -70,11 +74,31 @@ def tmux_paste_text(name: str, text: str, submit: bool = False) -> None:
         check=True,
     )
     subprocess.run(
-        ["tmux", "paste-buffer", "-d", "-p", "-r", "-b", "phonecodex-paste", "-t", name],
+        ["tmux", "paste-buffer", "-d", "-p", "-r", "-b", "phonecodex-paste", "-t", tmux_target(name)],
         check=True,
     )
     if submit:
-        subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), "Enter"], check=True)
+
+
+def tmux_paste_text(name: str, text: str, submit: bool = False) -> None:
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_PASTE_BYTES:
+        raise ValueError("paste is too large")
+    target = tmux_target(name)
+    try:
+        for line in text.splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            for start in range(0, len(body), 500):
+                chunk = body[start : start + 500]
+                if chunk:
+                    subprocess.run(["tmux", "send-keys", "-t", target, "-l", chunk], check=True)
+            if line.endswith(("\n", "\r")):
+                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+        if submit:
+            subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+    except subprocess.CalledProcessError:
+        tmux_paste_buffer(name, text, submit)
 
 
 def tmux_capture(name: str) -> str:
@@ -178,15 +202,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        host = display_host()
         rows = "\n".join(
-            "<tr>"
-            f"<td><a href=\"http://{html.escape(host)}:{session.port}/\">{html.escape(session.name)}</a></td>"
-            f"<td>{session.port}</td>"
-            f"<td>{html.escape(active_state(session))}</td>"
-            f"<td>{html.escape(session.workdir)}</td>"
-            f"<td><code>phonecodex attach {html.escape(session.name)}</code></td>"
-            "</tr>"
+            (
+                lambda url: "<tr>"
+                f"<td><a href=\"{html.escape(url)}\">{html.escape(session.name)}</a></td>"
+                f"<td>{session.port}</td>"
+                f"<td>{html.escape(active_state(session))}</td>"
+                f"<td>{html.escape(session.workdir)}</td>"
+                f"<td><code>phonecodex attach {html.escape(session.name)}</code></td>"
+                "</tr>"
+            )(
+                session.public_url.rstrip("/")
+                if session.public_url
+                else f"http://{html.escape(display_host_for_session(session))}:{session.proxy_port if session.proxy_enabled else session.port}/"
+            )
             for session in all_sessions()
         )
         body = f"""<!doctype html>
@@ -215,6 +244,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 </body>
 </html>"""
         self.send_text(200, body, "text/html; charset=utf-8")
+        return
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -265,4 +295,3 @@ def serve_index(bind_host: str | None = None, index_port: int = DEFAULT_INDEX_PO
     with ReusableThreadingTCPServer((bind, index_port), Handler) as httpd:
         print(f"PhoneCodex index listening on http://{bind}:{index_port}/", flush=True)
         httpd.serve_forever()
-

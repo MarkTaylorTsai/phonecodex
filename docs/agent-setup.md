@@ -1,19 +1,21 @@
 # Agent Setup Runbook
 
-Use this runbook when an agent is asked to set up PhoneCodex on a user's machine.
+Use this runbook when an agent is asked to install PhoneCodex on a user's
+machine. Make the smallest change that gives the user a working phone URL.
 
-## Read-Only Checks
+## 1. Read-Only Checks
 
 ```bash
 python3 --version
 command -v tmux || true
 command -v ttyd || true
 command -v tailscale || true
+command -v cloudflared || true
 command -v codex || true
-tailscale ip -4 2>/dev/null || true
+phonecodex doctor 2>/dev/null || true
 ```
 
-## Install The Package
+If the repo is not installed yet:
 
 ```bash
 git clone https://github.com/MarkTaylorTsai/phonecodex.git
@@ -22,47 +24,127 @@ python3 -m pip install --user .
 phonecodex doctor
 ```
 
-## Start Services
+## 2. Pick The Deployment Mode
+
+Use `local` only for host-machine tests:
 
 ```bash
-phonecodex install
+phonecodex service install --mode local
+phonecodex codex test-session /path/to/project --mode local
 ```
 
-## Add A Project
-
-Shell only:
+Use `tailscale` when the phone is in the same tailnet:
 
 ```bash
-phonecodex add my-project /path/to/project
+phonecodex service install --mode tailscale
+phonecodex codex project-name /path/to/project --mode tailscale
 ```
 
-Codex:
+Use Tailscale Serve when you want one stable tailnet HTTPS origin and proxy
+routing for both terminal and toolbar API:
 
 ```bash
-phonecodex codex my-project /path/to/project
+phonecodex deploy tailscale project-name --serve
+phonecodex service restart project-name
 ```
 
-## Verify
+Use Cloudflare only with a named tunnel and fixed hostname:
+
+```bash
+cloudflared tunnel create phonecodex
+phonecodex deploy cloudflare project-name \
+  --hostname phonecodex.example.com \
+  --tunnel phonecodex \
+  --route-dns
+phonecodex service restart project-name
+```
+
+Do not use `trycloudflare` quick tunnels or `localhost.run` as the final answer.
+They are temporary demo routes.
+
+## 3. Verify
 
 ```bash
 phonecodex list
-phonecodex url my-project
-phonecodex verify my-project
+phonecodex url project-name
+phonecodex verify project-name
 ```
 
-On the phone, open the URL. Press `Paste`; if clipboard read is blocked, long-press in
-the paste box, paste manually, then press `Insert` or `Ask`.
+For authenticated proxy sessions:
 
-## Troubleshooting
+```bash
+phonecodex verify project-name --auth-password 'the-password'
+```
 
-- `ttyd command not found`: install `ttyd` with the OS package manager or from the
-  upstream release package.
-- Phone cannot connect: verify Tailscale is connected on both devices and that
-  `phonecodex doctor` shows a Tailscale bind IP.
-- Toolbar says `no session`: the terminal page port is not registered in
-  `~/.config/phonecodex/sessions`.
-- Paste fails: ensure the index service is running on port `7680`.
-- Buttons are missing: run `phonecodex verify NAME`; if it does not report
-  `ok running session page contains toolbar`, rerun `phonecodex install` and
-  restart the session with
-  `phonecodex stop NAME && phonecodex codex NAME /path/to/project`.
+Expected important checks:
+
+```text
+ok generated mobile index
+ok index contains inline toolbar
+ok index pins session name
+ok toolbar has Paste/Insert/Ask
+ok toolbar has arrow keys
+ok proxy API base is origin
+```
+
+## 4. Service Commands
+
+Linux:
+
+```bash
+phonecodex service status project-name
+phonecodex service logs project-name
+phonecodex service restart project-name
+```
+
+macOS:
+
+```bash
+phonecodex service restart project-name
+ls ~/.config/phonecodex/logs
+```
+
+WSL2 without systemd:
+
+```bash
+phonecodex serve-index --bind-host 127.0.0.1 --port 7680
+phonecodex run-session project-name
+phonecodex run-proxy project-name
+```
+
+## 5. Troubleshooting
+
+Toolbar missing:
+
+```bash
+phonecodex verify project-name
+phonecodex stop project-name
+phonecodex codex project-name /path/to/project --mode tailscale
+```
+
+Toolbar buttons render but do nothing:
+
+- In proxy/public modes, confirm the generated HTML uses `location.origin`.
+- Confirm the proxy is running.
+- Confirm `/api/*` and `/mobile-toolbar.js` go through the proxy, not a hard-coded
+  `:7680` API origin.
+
+`Press Enter to Reconnect`:
+
+- Remove `ttyd` built-in auth from public paths.
+- Use `phonecodex run-proxy NAME` for auth.
+- Keep `ttyd` bound to `127.0.0.1` behind the proxy.
+
+Service cannot find commands:
+
+```bash
+phonecodex doctor
+export PHONECODEX_SERVICE_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+phonecodex service install --mode tailscale
+```
+
+Paste API returns OK but no text appears:
+
+- Update PhoneCodex and restart the session.
+- The current paste path targets `NAME:0.0` and sends literal keystrokes with
+  `tmux send-keys -l`.

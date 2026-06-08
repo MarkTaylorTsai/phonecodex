@@ -5,6 +5,7 @@ def toolbar_js(index_port: int) -> str:
     return f"""
 (function () {{
   const apiBase = window.PHONECODEX_API_BASE || `${{location.protocol}}//${{location.hostname}}:{index_port}`;
+  const configuredSessionName = window.PHONECODEX_SESSION_NAME || "";
   let sessionName = "";
 
   function focusTerminal() {{
@@ -315,6 +316,11 @@ def toolbar_js(index_port: int) -> str:
 
   async function init() {{
     installToolbar();
+    if (configuredSessionName) {{
+      sessionName = configuredSessionName;
+      setStatus(sessionName);
+      return;
+    }}
     try {{
       const response = await fetch(`${{apiBase}}/api/session?port=${{encodeURIComponent(location.port)}}`);
       if (!response.ok) throw new Error(await response.text());
