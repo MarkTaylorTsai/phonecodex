@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import __version__
@@ -28,6 +30,7 @@ from .config import (
     validate_name,
     write_session,
 )
+from .toolbar import toolbar_js
 from .server import serve_index
 
 
@@ -49,18 +52,22 @@ def ensure_mobile_index(index_port: int = DEFAULT_INDEX_PORT) -> Path:
     except (FileNotFoundError, ModuleNotFoundError):
         html = "<!doctype html><html><body><pre>mobile-index.html asset is missing</pre></body></html>"
 
-    replacement = f":{index_port}/mobile-toolbar.js"
-    if "/mobile-toolbar.js" in html:
-        html = re.sub(r":[0-9]+/mobile-toolbar\.js", replacement, html)
-    else:
-        script = (
-            "<script>(function(){"
-            "var s=document.createElement('script');"
-            f"s.src=location.protocol+'//'+location.hostname+':{index_port}/mobile-toolbar.js';"
-            "s.defer=true;document.body.appendChild(s);"
-            "})();</script>"
-        )
-        html = html.replace("</body>", script + "</body>")
+    # Older generated indexes loaded the toolbar from :7680/mobile-toolbar.js.
+    # Inline it instead so buttons still render when a browser/proxy refuses to
+    # fetch cross-port scripts. The API server is still required for key/paste.
+    html = re.sub(
+        r"<script>\s*\(function\s*\(\)\s*\{(?:(?!</script>).)*mobile-toolbar\.js(?:(?!</script>).)*</script>\s*",
+        "",
+        html,
+        flags=re.DOTALL,
+    )
+    inline_toolbar = (
+        "<script>\n"
+        f"window.PHONECODEX_API_BASE = location.protocol + '//' + location.hostname + ':{index_port}';\n"
+        f"{toolbar_js(index_port)}\n"
+        "</script>\n"
+    )
+    html = html.replace("</body>", inline_toolbar + "</body>")
 
     path = mobile_index_path(index_port)
     path.write_text(html, encoding="utf-8")
@@ -303,6 +310,51 @@ def cmd_url(args: argparse.Namespace) -> None:
     print(f"http://{display_host()}:{session.port}/")
 
 
+def cmd_verify(args: argparse.Namespace) -> None:
+    session = read_session(args.name)
+    index = ensure_mobile_index(session.index_port)
+    index_html = index.read_text(encoding="utf-8", errors="replace")
+    toolbar = toolbar_js(session.index_port)
+    host = display_host()
+    checks = [
+        ("session config", True, str(session_path(session.name))),
+        ("generated mobile index", index.exists(), str(index)),
+        ("index contains inline toolbar", "pcx-toolbar" in index_html and "pcx-paste-ask" in index_html, str(index)),
+        ("toolbar has Paste/Insert/Ask", all(token in toolbar for token in ["Paste", "Insert", "Ask"]), ""),
+        ("toolbar has arrow keys", all(token in toolbar for token in ['sendKey("up")', 'sendKey("down")', 'sendKey("left")', 'sendKey("right")']), ""),
+    ]
+    if not args.skip_network:
+        session_url = f"http://{host}:{session.port}/"
+        toolbar_url = f"http://{host}:{session.index_port}/mobile-toolbar.js"
+        try:
+            with urllib.request.urlopen(session_url, timeout=2) as response:
+                page = response.read(2_000_000).decode("utf-8", errors="replace")
+            checks.append(("running session page contains toolbar", "pcx-toolbar" in page, session_url))
+        except (OSError, urllib.error.URLError) as error:
+            checks.append(("running session page reachable", False, f"{session_url} ({error})"))
+        try:
+            with urllib.request.urlopen(toolbar_url, timeout=2) as response:
+                served_toolbar = response.read(256_000).decode("utf-8", errors="replace")
+            checks.append(("toolbar API endpoint serves buttons", "pcx-toolbar" in served_toolbar, toolbar_url))
+        except (OSError, urllib.error.URLError) as error:
+            checks.append(("toolbar API endpoint reachable", False, f"{toolbar_url} ({error})"))
+    for label, ok, detail in checks:
+        print(f"{'ok' if ok else '!!'} {label}{(': ' + detail) if detail else ''}")
+    print(f"index URL:   http://{host}:{session.index_port}/")
+    print(f"session URL: http://{host}:{session.port}/")
+    if platform.system().lower() == "linux" and command_exists("systemctl"):
+        status = subprocess.run(
+            ["systemctl", "--user", "is-active", f"phonecodex@{session.name}.service"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+        print(f"service:     {status or 'unknown'}")
+    if not all(ok for _, ok, _ in checks):
+        raise SystemExit(1)
+
+
 def cmd_attach(args: argparse.Namespace) -> None:
     session = read_session(args.name)
     os.environ["PHONECODEX_WORKDIR"] = session.workdir
@@ -429,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
     url = sub.add_parser("url", help="print a session URL")
     url.add_argument("name")
     url.set_defaults(func=cmd_url)
+
+    verify = sub.add_parser("verify", help="verify toolbar/index generation for a session")
+    verify.add_argument("name")
+    verify.add_argument("--skip-network", action="store_true", help="only check generated files and config")
+    verify.set_defaults(func=cmd_verify)
 
     attach = sub.add_parser("attach", help="attach to a configured tmux session")
     attach.add_argument("name")

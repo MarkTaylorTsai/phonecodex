@@ -47,6 +47,7 @@ python3 -m pip install --user .
 phonecodex doctor
 phonecodex install
 phonecodex codex my-project /path/to/project
+phonecodex verify my-project
 phonecodex list
 ```
 
@@ -153,6 +154,7 @@ phonecodex codex NAME [DIR] [--port PORT]
 phonecodex expose NAME [DIR]
 phonecodex list
 phonecodex url NAME
+phonecodex verify NAME
 phonecodex attach NAME
 phonecodex stop NAME
 phonecodex kill NAME
@@ -174,6 +176,38 @@ phonecodex run-session NAME
   private network such as Tailscale.
 - Do not expose these ports through public tunnels unless you add authentication in
   front of them.
+
+## If The Mobile Buttons Are Missing
+
+If the terminal opens but you do not see `Esc`, arrows, `Paste`, `Insert`, or `Ask`,
+the browser is seeing ttyd's default page instead of PhoneCodex's generated mobile
+index, or the old generated index needs to be refreshed.
+
+Run:
+
+```bash
+git pull
+python3 -m pip install --user --upgrade .
+phonecodex install
+phonecodex stop NAME
+phonecodex codex NAME /path/to/project
+phonecodex verify NAME
+```
+
+`phonecodex verify NAME` should report:
+
+```text
+ok generated mobile index
+ok index contains inline toolbar
+ok toolbar has Paste/Insert/Ask
+ok toolbar has arrow keys
+ok running session page contains toolbar
+ok toolbar API endpoint serves buttons
+```
+
+Use the direct `http://<tailscale-ip>:PORT/` URL printed by `phonecodex list`.
+If you open the session through an HTTPS proxy/funnel, browsers may block the
+cross-port toolbar API even when the buttons render.
 
 ## Project Layout
 

@@ -47,6 +47,7 @@ phonecodex codex my-project /path/to/project
 ```bash
 phonecodex list
 phonecodex url my-project
+phonecodex verify my-project
 ```
 
 On the phone, open the URL. Press `Paste`; if clipboard read is blocked, long-press in
@@ -61,3 +62,7 @@ the paste box, paste manually, then press `Insert` or `Ask`.
 - Toolbar says `no session`: the terminal page port is not registered in
   `~/.config/phonecodex/sessions`.
 - Paste fails: ensure the index service is running on port `7680`.
+- Buttons are missing: run `phonecodex verify NAME`; if it does not report
+  `ok running session page contains toolbar`, rerun `phonecodex install` and
+  restart the session with
+  `phonecodex stop NAME && phonecodex codex NAME /path/to/project`.

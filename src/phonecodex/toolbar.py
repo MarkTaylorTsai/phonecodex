@@ -4,7 +4,7 @@ from __future__ import annotations
 def toolbar_js(index_port: int) -> str:
     return f"""
 (function () {{
-  const apiBase = `${{location.protocol}}//${{location.hostname}}:{index_port}`;
+  const apiBase = window.PHONECODEX_API_BASE || `${{location.protocol}}//${{location.hostname}}:{index_port}`;
   let sessionName = "";
 
   function focusTerminal() {{
@@ -333,4 +333,3 @@ def toolbar_js(index_port: int) -> str:
   }}
 }})();
 """
-
