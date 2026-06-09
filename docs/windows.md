@@ -35,7 +35,10 @@ git clone https://github.com/MarkTaylorTsai/phonecodex.git
 cd phonecodex
 python3 -m pip install --user .
 phonecodex doctor
+phonecodex verify --local-test
 ```
+
+For the newer detailed WSL2 runbook, see `docs/windows-wsl.md`.
 
 ## WSL2 With systemd
 

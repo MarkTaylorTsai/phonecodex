@@ -90,6 +90,12 @@ phonecodex service install --mode tailscale
 Run `phonecodex doctor` to check whether `tmux`, `ttyd`, `tailscale`,
 `cloudflared`, and `codex` are visible through that service PATH.
 
+Proxy auth can be read from `~/.config/phonecodex/env`. Create it with:
+
+```bash
+phonecodex auth init --user phonecodex --generate
+```
+
 ## Deployment Examples
 
 Tailscale direct:

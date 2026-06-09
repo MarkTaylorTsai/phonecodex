@@ -63,7 +63,9 @@ Equivalent systemd units:
 
 ```text
 phonecodex-index.service
+phonecodex-api.service
 phonecodex@warp.service
+phonecodex-session@warp.service
 phonecodex-proxy@warp.service
 ```
 
@@ -86,6 +88,18 @@ phonecodex service install --mode tailscale
 
 Include any directory that contains `tmux`, `ttyd`, `tailscale`, `cloudflared`,
 or `codex`.
+
+Proxy auth can be read from:
+
+```text
+~/.config/phonecodex/env
+```
+
+Create it with:
+
+```bash
+phonecodex auth init --user phonecodex --generate
+```
 
 ## Deployment Examples
 

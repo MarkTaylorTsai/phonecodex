@@ -10,8 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 from phonecodex import cli, server
-from phonecodex.config import SessionConfig, read_session, session_path, write_session
-from phonecodex.proxy import hash_password, verify_basic_auth
+from phonecodex.config import SessionConfig, env_file_path, parse_env_file, read_session, session_path, write_session
+from phonecodex.config import ensure_env_file
+from phonecodex.proxy import ProxyHandler, hash_password, verify_basic_auth
 
 
 class PhoneCodexTests(unittest.TestCase):
@@ -125,6 +126,121 @@ class PhoneCodexTests(unittest.TestCase):
         self.assertIn("hostname: phonecodex.example.com", text)
         self.assertIn("service: http://127.0.0.1:8781", text)
         self.assertIn("service: http_status:404", text)
+
+    def test_auth_init_writes_env_file(self) -> None:
+        cli.main(["auth", "init", "--user", "phonecodex", "--auth-password", "secret"])
+
+        values = parse_env_file()
+
+        self.assertEqual(values["PHONECODEX_AUTH_USER"], "phonecodex")
+        self.assertEqual(values["PHONECODEX_AUTH_PASSWORD"], "secret")
+        self.assertTrue(env_file_path().exists())
+
+    def test_auth_init_does_not_overwrite_without_force(self) -> None:
+        cli.main(["auth", "init", "--user", "phonecodex", "--auth-password", "first"])
+        cli.main(["auth", "init", "--user", "phonecodex", "--auth-password", "second"])
+
+        self.assertEqual(parse_env_file()["PHONECODEX_AUTH_PASSWORD"], "first")
+
+    def test_auth_password_env_hashes_session_password(self) -> None:
+        os.environ["PCX_TEST_PASSWORD"] = "from-env"
+        self.addCleanup(lambda: os.environ.pop("PCX_TEST_PASSWORD", None))
+
+        cli.main(
+            [
+                "add",
+                "envpass",
+                self.temp.name,
+                "--mode",
+                "cloudflare",
+                "--cloudflare-hostname",
+                "pcx.example.com",
+                "--cloudflare-tunnel",
+                "pcx",
+                "--auth-user",
+                "phonecodex",
+                "--auth-password-env",
+                "PCX_TEST_PASSWORD",
+                "--no-start",
+                "--no-tmux",
+            ]
+        )
+        session = read_session("envpass")
+
+        self.assertEqual(session.auth_username, "phonecodex")
+        self.assertEqual(session.auth_password_hash, hash_password("from-env"))
+
+    def test_generated_deploy_auth_fills_empty_env_file(self) -> None:
+        ensure_env_file("phonecodex", "")
+        cli.main(["add", "demo", self.temp.name, "--mode", "local", "--port", "7766", "--no-start", "--no-tmux"])
+
+        cli.main(
+            [
+                "deploy",
+                "cloudflare",
+                "demo",
+                "--hostname",
+                "phonecodex.example.com",
+                "--tunnel",
+                "pcx",
+                "--config",
+                str(Path(self.temp.name) / "cloudflared.yml"),
+            ]
+        )
+        values = parse_env_file()
+
+        self.assertEqual(values["PHONECODEX_AUTH_USER"], "phonecodex")
+        self.assertGreater(len(values["PHONECODEX_AUTH_PASSWORD"]), 20)
+
+    def test_proxy_rewrites_public_session_port(self) -> None:
+        session = self.make_session(proxy_enabled=True, proxy_port=8787)
+        handler = object.__new__(ProxyHandler)
+        handler.session = session
+        handler.path = "/api/session?port=443"
+
+        self.assertEqual(handler._backend_path(), "/api/session?port=8787")
+
+    def test_cloudflare_multi_creates_sessions_and_ingress(self) -> None:
+        config = Path(self.temp.name) / "cloudflared.yml"
+        cli.main(
+            [
+                "deploy",
+                "cloudflare",
+                "multi",
+                "--tunnel",
+                "pcx",
+                "--base-hostname",
+                "phonecodex.example.com",
+                "--count",
+                "3",
+                "--start-port",
+                "9001",
+                "--start-proxy-port",
+                "9101",
+                "--directory",
+                self.temp.name,
+                "--config",
+                str(config),
+                "--auth-user",
+                "phonecodex",
+                "--auth-password",
+                "secret",
+                "--no-start",
+                "--no-tmux",
+            ]
+        )
+
+        first = read_session("phonecodex")
+        second = read_session("phonecodex-2")
+        third = read_session("phonecodex-3")
+        text = config.read_text(encoding="utf-8")
+
+        self.assertEqual(first.port, 9001)
+        self.assertEqual(second.proxy_port, 9102)
+        self.assertEqual(third.cloudflare_hostname, "phonecodex3.example.com")
+        self.assertIn("hostname: phonecodex.example.com", text)
+        self.assertIn("hostname: phonecodex2.example.com", text)
+        self.assertIn("hostname: phonecodex3.example.com", text)
 
 
 if __name__ == "__main__":

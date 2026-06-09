@@ -4,13 +4,14 @@ import base64
 import hashlib
 import http.client
 import http.server
+import os
 import select
 import socket
 import socketserver
-import threading
+import urllib.parse
 from dataclasses import dataclass
 
-from .config import SessionConfig, read_session
+from .config import SessionConfig, parse_env_file, read_session
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,18 @@ def verify_basic_auth(header: str, username: str, password_hash: str) -> bool:
     return hash_password(supplied_password) == password_hash
 
 
+def effective_auth(session: SessionConfig) -> tuple[str, str]:
+    env_values = parse_env_file()
+    username = (
+        os.environ.get("PHONECODEX_AUTH_USER")
+        or session.auth_username
+        or env_values.get("PHONECODEX_AUTH_USER", "")
+    )
+    password = os.environ.get("PHONECODEX_AUTH_PASSWORD") or env_values.get("PHONECODEX_AUTH_PASSWORD", "")
+    password_hash = hash_password(password) if password else session.auth_password_hash
+    return username, password_hash
+
+
 class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     allow_reuse_port = True
@@ -48,10 +61,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     session: SessionConfig
 
     def _auth_ok(self) -> bool:
+        username, password_hash = effective_auth(self.session)
         return verify_basic_auth(
             self.headers.get("Authorization", ""),
-            self.session.auth_username,
-            self.session.auth_password_hash,
+            username,
+            password_hash,
         )
 
     def _send_auth_required(self) -> None:
@@ -65,6 +79,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/api/") or self.path.startswith("/mobile-toolbar.js"):
             return ProxyTarget(self.session.api_bind_host or "127.0.0.1", self.session.index_port)
         return ProxyTarget(self.session.ttyd_bind_host or "127.0.0.1", self.session.port)
+
+    def _backend_path(self) -> str:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/session":
+            return self.path
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        port = query.get("port", [""])[0]
+        if port in {"", "80", "443"}:
+            query["port"] = [str(self.session.proxy_port or self.session.port)]
+        return urllib.parse.urlunparse(
+            (
+                "",
+                "",
+                parsed.path,
+                parsed.params,
+                urllib.parse.urlencode(query, doseq=True),
+                parsed.fragment,
+            )
+        )
 
     def _forward_headers(self, target: ProxyTarget) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -84,7 +117,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
         conn = http.client.HTTPConnection(target.host, target.port, timeout=20)
         try:
-            conn.request(self.command, self.path, body=body, headers=self._forward_headers(target))
+            conn.request(self.command, self._backend_path(), body=body, headers=self._forward_headers(target))
             response = conn.getresponse()
             data = response.read()
             self.send_response(response.status, response.reason)
@@ -103,7 +136,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream = socket.create_connection((target.host, target.port), timeout=20)
         try:
             headers = self._forward_headers(target)
-            header_lines = [f"{self.command} {self.path} {self.request_version}"]
+            header_lines = [f"{self.command} {self._backend_path()} {self.request_version}"]
             header_lines.extend(f"{key}: {value}" for key, value in headers.items())
             header_lines.append("")
             header_lines.append("")
@@ -160,4 +193,3 @@ def serve_proxy(name: str, bind_host: str | None = None, port: int | None = None
     with ReusableThreadingTCPServer((bind, listen_port), Handler) as httpd:
         print(f"PhoneCodex proxy listening on http://{bind}:{listen_port}/ for {name}", flush=True)
         httpd.serve_forever()
-

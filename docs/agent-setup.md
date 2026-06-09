@@ -22,6 +22,7 @@ git clone https://github.com/MarkTaylorTsai/phonecodex.git
 cd phonecodex
 python3 -m pip install --user .
 phonecodex doctor
+phonecodex verify --local-test
 ```
 
 ## 2. Pick The Deployment Mode
@@ -44,6 +45,7 @@ Use Tailscale Serve when you want one stable tailnet HTTPS origin and proxy
 routing for both terminal and toolbar API:
 
 ```bash
+phonecodex auth init --user phonecodex --generate
 phonecodex deploy tailscale project-name --serve
 phonecodex service restart project-name
 ```
@@ -52,6 +54,7 @@ Use Cloudflare only with a named tunnel and fixed hostname:
 
 ```bash
 cloudflared tunnel create phonecodex
+phonecodex auth init --user phonecodex --generate
 phonecodex deploy cloudflare project-name \
   --hostname phonecodex.example.com \
   --tunnel phonecodex \
@@ -68,6 +71,7 @@ They are temporary demo routes.
 phonecodex list
 phonecodex url project-name
 phonecodex verify project-name
+phonecodex verify --local-test
 ```
 
 For authenticated proxy sessions:

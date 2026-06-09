@@ -14,6 +14,7 @@ from pathlib import Path
 
 DEFAULT_INDEX_PORT = 7680
 DEFAULT_PROXY_PORT = 8780
+DEFAULT_ENV_FILE_NAME = "env"
 PORT_START = 7681
 PORT_END = 7780
 PROXY_PORT_START = 8781
@@ -90,6 +91,10 @@ def assets_dir() -> Path:
     return config_dir() / "assets"
 
 
+def env_file_path() -> Path:
+    return config_dir() / DEFAULT_ENV_FILE_NAME
+
+
 def mobile_index_path(index_port: int = DEFAULT_INDEX_PORT) -> Path:
     return assets_dir() / f"mobile-index-{index_port}.html"
 
@@ -106,6 +111,39 @@ def ensure_dirs() -> None:
     if os.name != "nt":
         os.chmod(config_dir(), 0o700)
         os.chmod(sessions_dir(), 0o700)
+
+
+def parse_env_file(path: Path | None = None) -> dict[str, str]:
+    override = os.environ.get("PHONECODEX_ENV_FILE")
+    target = path or (Path(override).expanduser() if override else env_file_path())
+    if not target.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in target.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            values[key] = value
+    return values
+
+
+def ensure_env_file(user: str = "phonecodex", password: str = "") -> Path:
+    ensure_dirs()
+    path = env_file_path()
+    if not path.exists():
+        lines = [f"PHONECODEX_AUTH_USER={user}"]
+        if password:
+            lines.append(f"PHONECODEX_AUTH_PASSWORD={password}")
+        else:
+            lines.append("PHONECODEX_AUTH_PASSWORD=")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    return path
 
 
 def validate_name(name: str) -> None:

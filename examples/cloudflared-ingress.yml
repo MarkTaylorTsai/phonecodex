@@ -1,0 +1,9 @@
+tunnel: phonecodex
+credentials-file: /home/example/.cloudflared/phonecodex.json
+
+ingress:
+  - hostname: phonecodex.example.com
+    service: http://127.0.0.1:7690
+  - hostname: phonecodex2.example.com
+    service: http://127.0.0.1:7691
+  - service: http_status:404

@@ -8,8 +8,11 @@ import os
 import platform
 import re
 import secrets
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -30,7 +33,10 @@ from .config import (
     display_host,
     display_host_for_session,
     ensure_dirs,
+    ensure_env_file,
+    env_file_path,
     is_wsl,
+    parse_env_file,
     python_command,
     read_session,
     run_text,
@@ -41,8 +47,10 @@ from .config import (
     validate_name,
     write_session,
 )
+from .deploy import hostname_for_session, multi_session_name, patch_cloudflared_config
 from .proxy import hash_password, serve_proxy
 from .server import serve_index
+from .services import launchd_plist_text, systemd_unit_text
 from .toolbar import toolbar_js
 
 
@@ -109,34 +117,23 @@ def unit_dir() -> Path:
 
 
 def systemd_unit(name: str, exec_args: list[str]) -> str:
-    quoted = " ".join(exec_args)
-    return f"""[Unit]
-Description={name}
-After=default.target
-
-[Service]
-Type=simple
-Environment=PATH={service_path()}
-ExecStart={quoted}
-Restart=on-failure
-RestartSec=2s
-
-[Install]
-WantedBy=default.target
-"""
+    return systemd_unit_text(name, exec_args, service_path(), env_file_path())
 
 
 def install_systemd(index_port: int, bind_host: str, *, start_index: bool) -> None:
     ensure_dirs()
+    ensure_env_file()
     unit_dir().mkdir(parents=True, exist_ok=True)
     python = python_command()
+    session_text = systemd_unit(
+        "PhoneCodex mobile terminal session (%i)",
+        [python, "-m", "phonecodex", "run-session", "%i"],
+    )
     (unit_dir() / "phonecodex@.service").write_text(
-        systemd_unit(
-            "PhoneCodex mobile terminal session (%i)",
-            [python, "-m", "phonecodex", "run-session", "%i"],
-        ),
+        session_text,
         encoding="utf-8",
     )
+    (unit_dir() / "phonecodex-session@.service").write_text(session_text, encoding="utf-8")
     (unit_dir() / "phonecodex-proxy@.service").write_text(
         systemd_unit(
             "PhoneCodex authenticated terminal proxy (%i)",
@@ -144,13 +141,12 @@ def install_systemd(index_port: int, bind_host: str, *, start_index: bool) -> No
         ),
         encoding="utf-8",
     )
-    (unit_dir() / "phonecodex-index.service").write_text(
-        systemd_unit(
-            "PhoneCodex index and toolbar API",
-            [python, "-m", "phonecodex", "serve-index", "--bind-host", bind_host, "--port", str(index_port)],
-        ),
-        encoding="utf-8",
+    api_text = systemd_unit(
+        "PhoneCodex index and toolbar API",
+        [python, "-m", "phonecodex", "serve-index", "--bind-host", bind_host, "--port", str(index_port)],
     )
+    (unit_dir() / "phonecodex-index.service").write_text(api_text, encoding="utf-8")
+    (unit_dir() / "phonecodex-api.service").write_text(api_text, encoding="utf-8")
     if command_exists("systemctl"):
         run(["systemctl", "--user", "daemon-reload"])
         if start_index:
@@ -162,39 +158,14 @@ def launch_agents_dir() -> Path:
 
 
 def plist(label: str, args: list[str], log_name: str) -> str:
-    args_xml = "\n".join(f"    <string>{arg}</string>" for arg in args)
     log_dir = config_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-{args_xml}
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>{service_path()}</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{log_dir / (log_name + ".out.log")}</string>
-  <key>StandardErrorPath</key>
-  <string>{log_dir / (log_name + ".err.log")}</string>
-</dict>
-</plist>
-"""
+    return launchd_plist_text(label, args, log_name, log_dir, service_path(), env_file_path())
 
 
 def install_launchd(index_port: int, bind_host: str, *, start_index: bool) -> None:
     ensure_dirs()
+    ensure_env_file()
     launch_agents_dir().mkdir(parents=True, exist_ok=True)
     path = launch_agents_dir() / "com.phonecodex.index.plist"
     path.write_text(
@@ -320,9 +291,22 @@ def ensure_tmux_session(name: str, workdir: Path, initial_command: str = "") -> 
         run(["tmux", "send-keys", "-t", f"{name}:0.0", initial_command, "C-m"])
 
 
+def password_from_args(args: argparse.Namespace) -> str:
+    password = getattr(args, "auth_password", "") or ""
+    password_env = getattr(args, "auth_password_env", "") or ""
+    if password_env:
+        password = os.environ.get(password_env, "")
+        if not password:
+            die(f"environment variable is empty or missing: {password_env}")
+    return password
+
+
 def read_password(args: argparse.Namespace, mode: str, proxy_enabled: bool) -> tuple[str, str, str]:
-    username = args.auth_user or ""
-    password = args.auth_password or ""
+    if not proxy_enabled:
+        return "", "", ""
+    env_values = parse_env_file()
+    username = args.auth_user or env_values.get("PHONECODEX_AUTH_USER", "")
+    password = password_from_args(args) or env_values.get("PHONECODEX_AUTH_PASSWORD", "")
     generated = ""
     if proxy_enabled and mode == "cloudflare":
         username = username or "phonecodex"
@@ -332,6 +316,43 @@ def read_password(args: argparse.Namespace, mode: str, proxy_enabled: bool) -> t
     if username and not password:
         password = getpass.getpass("PhoneCodex proxy password: ")
     return username, hash_password(password) if password else "", generated
+
+
+def configure_proxy_auth(
+    session: SessionConfig,
+    args: argparse.Namespace,
+    *,
+    default_username: str = "phonecodex",
+    generate_if_missing: bool = False,
+) -> tuple[str, str, str]:
+    env_values = parse_env_file()
+    username = args.auth_user or session.auth_username or env_values.get("PHONECODEX_AUTH_USER", "") or default_username
+    password = password_from_args(args) or env_values.get("PHONECODEX_AUTH_PASSWORD", "")
+    generated = ""
+    if not password and not session.auth_password_hash and generate_if_missing:
+        generated = secrets.token_urlsafe(18)
+        password = generated
+    password_hash = hash_password(password) if password else session.auth_password_hash
+    return username, password_hash, generated
+
+
+def maybe_write_generated_env(username: str, password: str) -> None:
+    if not password:
+        return
+    path = env_file_path()
+    existing_password = parse_env_file().get("PHONECODEX_AUTH_PASSWORD", "")
+    if existing_password:
+        print(f"generated proxy auth kept in session hash; env file already has a password: {path}")
+        return
+    ensure_dirs()
+    path.write_text(
+        f"PHONECODEX_AUTH_USER={username}\nPHONECODEX_AUTH_PASSWORD={password}\n",
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    print(f"generated proxy auth written to {path}")
+    print("store this password now; the env file is chmod 600")
 
 
 def create_session(args: argparse.Namespace, *, codex: bool = False, expose: bool = False) -> None:
@@ -437,7 +458,170 @@ def cmd_url(args: argparse.Namespace) -> None:
     print(session_url(read_session(args.name)))
 
 
+def basic_auth_header(username: str, password: str) -> str:
+    import base64
+
+    raw = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def request_text(url: str, *, password: str = "", username: str = "phonecodex", data: dict[str, object] | None = None) -> tuple[int, str]:
+    body = None
+    request = urllib.request.Request(url)
+    if password:
+        request.add_header("Authorization", basic_auth_header(username, password))
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, data=body, timeout=3) as response:
+            return response.status, response.read(2_000_000).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(2_000_000).decode("utf-8", errors="replace")
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_port(port: int, timeout: float = 8) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def print_checks(checks: list[tuple[str, bool, str]]) -> None:
+    for label, ok, detail in checks:
+        print(f"{'ok' if ok else '!!'} {label}{(': ' + detail) if detail else ''}")
+    if not all(ok for _, ok, _ in checks):
+        raise SystemExit(1)
+
+
+def cmd_verify_local_test(args: argparse.Namespace) -> None:
+    checks: list[tuple[str, bool, str]] = [
+        ("python package import", True, "phonecodex"),
+        ("tmux exists", command_exists("tmux"), command_path("tmux") or "-"),
+        ("ttyd exists", command_exists("ttyd"), command_path("ttyd") or "-"),
+    ]
+    if not all(ok for _, ok, _ in checks):
+        print_checks(checks)
+        return
+
+    password = "phonecodex-local-test"
+    name = "phonecodex-local-test"
+    processes: list[subprocess.Popen[bytes]] = []
+    old_config = os.environ.get("PHONECODEX_CONFIG_DIR")
+    with tempfile.TemporaryDirectory(prefix="phonecodex-local-test-") as temp:
+        os.environ["PHONECODEX_CONFIG_DIR"] = temp
+        env = os.environ.copy()
+        port = free_tcp_port()
+        proxy_port = free_tcp_port()
+        index_port = free_tcp_port()
+        try:
+            create = [
+                sys.executable,
+                "-m",
+                "phonecodex",
+                "add",
+                name,
+                temp,
+                "--mode",
+                "local",
+                "--proxy",
+                "--auth-user",
+                "phonecodex",
+                "--auth-password",
+                password,
+                "--port",
+                str(port),
+                "--proxy-port",
+                str(proxy_port),
+                "--index-port",
+                str(index_port),
+                "--no-start",
+                "--no-tmux",
+            ]
+            subprocess.run(create, check=True, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", temp], check=True)
+            checks.append(("tmux session exists", True, name))
+
+            for command in [
+                [sys.executable, "-m", "phonecodex", "serve-index", "--bind-host", "127.0.0.1", "--port", str(index_port)],
+                [sys.executable, "-m", "phonecodex", "run-session", name],
+                [sys.executable, "-m", "phonecodex", "run-proxy", name],
+            ]:
+                processes.append(subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env))
+
+            checks.append(("API port listening", wait_for_port(index_port), str(index_port)))
+            checks.append(("ttyd port listening", wait_for_port(port), str(port)))
+            checks.append(("proxy port listening", wait_for_port(proxy_port), str(proxy_port)))
+
+            base = f"http://127.0.0.1:{proxy_port}"
+            status, _ = request_text(base + "/")
+            checks.append(("no-auth proxy returns 401", status == 401, str(status)))
+            status, html = request_text(base + "/", username="phonecodex", password=password)
+            checks.append(("with-auth proxy returns 200", status == 200, str(status)))
+            checks.append(("HTML includes toolbar", "pcx-toolbar" in html and "pcx-paste-ask" in html, base + "/"))
+            checks.append(("HTML API base is location.origin", "window.PHONECODEX_API_BASE = location.origin" in html, base + "/"))
+
+            status, body = request_text(base + "/api/session?port=443", username="phonecodex", password=password)
+            session_payload = json.loads(body) if status == 200 else {}
+            checks.append(("api session maps public port", session_payload.get("name") == name, body[:200]))
+
+            status, body = request_text(
+                base + "/api/key",
+                username="phonecodex",
+                password=password,
+                data={"session": name, "key": "tab"},
+            )
+            checks.append(("api key returns ok", status == 200 and '"ok": true' in body, body[:200]))
+
+            marker = "PHONECODEX_LOCAL_TEST_MARKER"
+            status, body = request_text(
+                base + "/api/paste",
+                username="phonecodex",
+                password=password,
+                data={"session": name, "text": marker, "submit": False},
+            )
+            time.sleep(0.3)
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", name],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            ).stdout
+            checks.append(("api paste returns ok", status == 200 and '"ok": true' in body, body[:200]))
+            checks.append(("paste appears in tmux capture", marker in capture, marker))
+        finally:
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                try:
+                    process.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            subprocess.run(["tmux", "kill-session", "-t", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if old_config is None:
+                os.environ.pop("PHONECODEX_CONFIG_DIR", None)
+            else:
+                os.environ["PHONECODEX_CONFIG_DIR"] = old_config
+    print_checks(checks)
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
+    if getattr(args, "local_test", False):
+        cmd_verify_local_test(args)
+        return
+    if not args.name:
+        die("verify requires NAME unless --local-test is used")
     session = read_session(args.name)
     index = ensure_mobile_index(session)
     index_html = index.read_text(encoding="utf-8", errors="replace")
@@ -461,10 +645,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
             try:
                 request = urllib.request.Request(url)
                 if session.auth_username and args.auth_password:
-                    import base64
-
-                    raw = f"{session.auth_username}:{args.auth_password}".encode("utf-8")
-                    request.add_header("Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
+                    request.add_header("Authorization", basic_auth_header(session.auth_username, args.auth_password))
                 with urllib.request.urlopen(request, timeout=2) as response:
                     page = response.read(2_000_000).decode("utf-8", errors="replace")
                 checks.append((label, "pcx-toolbar" in page, url))
@@ -473,8 +654,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
                 if session.auth_username and not args.auth_password:
                     detail += " - pass --auth-password for authenticated proxies"
                 checks.append((label.replace("contains", "reachable"), False, detail))
-    for label, ok, detail in checks:
-        print(f"{'ok' if ok else '!!'} {label}{(': ' + detail) if detail else ''}")
+    print_checks(checks)
     print(f"session URL: {session_url(session)}")
     if platform.system().lower() == "linux" and command_exists("systemctl"):
         for unit in [f"phonecodex@{session.name}.service", f"phonecodex-proxy@{session.name}.service"]:
@@ -486,8 +666,6 @@ def cmd_verify(args: argparse.Namespace) -> None:
                 stderr=subprocess.DEVNULL,
             ).stdout.strip()
             print(f"{unit}: {status or 'unknown'}")
-    if not all(ok for _, ok, _ in checks):
-        raise SystemExit(1)
 
 
 def cmd_attach(args: argparse.Namespace) -> None:
@@ -533,6 +711,56 @@ def cmd_run_session(args: argparse.Namespace) -> None:
 
 def cmd_run_proxy(args: argparse.Namespace) -> None:
     serve_proxy(args.name, args.bind_host, args.port)
+
+
+def update_proxy_session(
+    session: SessionConfig,
+    args: argparse.Namespace,
+    *,
+    proxy_port: int | None = None,
+    proxy_bind_host: str = "127.0.0.1",
+    generate_auth: bool = False,
+) -> SessionConfig:
+    selected_proxy_port = proxy_port or getattr(args, "proxy_port", None) or session.proxy_port or choose_proxy_port(session, proxy_bind_host)
+    auth_user, auth_hash, generated_password = configure_proxy_auth(session, args, generate_if_missing=generate_auth)
+    updated = SessionConfig(
+        **{
+            **session.__dict__,
+            "proxy_enabled": True,
+            "proxy_port": int(selected_proxy_port),
+            "proxy_bind_host": proxy_bind_host,
+            "ttyd_bind_host": "127.0.0.1",
+            "api_bind_host": "127.0.0.1",
+            "api_base": "origin",
+            "auth_username": auth_user,
+            "auth_password_hash": auth_hash,
+        }
+    )
+    write_session(updated)
+    ensure_mobile_index(updated)
+    if generated_password:
+        maybe_write_generated_env(auth_user, generated_password)
+    return updated
+
+
+def cmd_proxy_run(args: argparse.Namespace) -> None:
+    session = read_session(args.name)
+    if args.proxy_port or args.auth_user or args.auth_password or args.auth_password_env:
+        session = update_proxy_session(session, args, proxy_bind_host=args.bind_host or session.proxy_bind_host or "127.0.0.1")
+    serve_proxy(session.name, args.bind_host, args.proxy_port)
+
+
+def cmd_proxy_install_service(args: argparse.Namespace) -> None:
+    session = read_session(args.name)
+    session = update_proxy_session(session, args, generate_auth=bool(args.generate_auth))
+    start_index_service(session.index_port, session.mode, session.api_bind_host)
+    start_session_service(session)
+    print(f"proxy service: {session.name} http://{session.proxy_bind_host}:{session.proxy_port}/")
+
+
+def cmd_proxy_verify(args: argparse.Namespace) -> None:
+    args.skip_network = bool(args.skip_network)
+    cmd_verify(args)
 
 
 def cmd_tmux_wrapper(args: argparse.Namespace) -> None:
@@ -586,62 +814,77 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         print("warning: native Windows is limited; WSL2 is the supported path.")
 
 
-def patch_cloudflared_config(path: Path, hostname: str, service_url: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    rule = f"  - hostname: {hostname}\n    service: {service_url}\n"
-    if f"hostname: {hostname}" in existing:
-        lines = existing.splitlines()
-        output: list[str] = []
-        skip_next = False
-        for idx, line in enumerate(lines):
-            if skip_next:
-                output.append(f"    service: {service_url}")
-                skip_next = False
-                continue
-            output.append(line)
-            if line.strip() == f"hostname: {hostname}":
-                skip_next = idx + 1 < len(lines) and lines[idx + 1].strip().startswith("service:")
-        path.write_text("\n".join(output) + "\n", encoding="utf-8")
+def cmd_auth(args: argparse.Namespace) -> None:
+    if args.auth_command != "init":
+        die("unsupported auth command")
+    path = env_file_path()
+    if path.exists() and not args.force:
+        print(f"env file already exists: {path}")
+        print("use --force to overwrite it")
         return
-    if "ingress:" not in existing:
-        existing = existing.rstrip() + "\ningress:\n"
-    fallback = "  - service: http_status:404"
-    if fallback in existing:
-        existing = existing.replace(fallback, rule + fallback)
-    else:
-        existing = existing.rstrip() + "\n" + rule + fallback + "\n"
-    path.write_text(existing, encoding="utf-8")
+    password = password_from_args(args)
+    generated = ""
+    if args.generate and not password:
+        generated = secrets.token_urlsafe(18)
+        password = generated
+    if args.force and path.exists():
+        path.unlink()
+    path = ensure_env_file(args.user, password)
+    print(f"env file: {path}")
+    print("permissions: 600")
+    if generated:
+        print(f"generated proxy auth: {args.user}:{generated}")
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
+    if args.kind == "cloudflare" and (getattr(args, "count", 1) > 1 or getattr(args, "name", "") == "multi"):
+        cmd_deploy_cloudflare_multi(args)
+        return
     session = read_session(args.name)
     if args.kind == "local":
-        proxy_port = choose_proxy_port(session, "127.0.0.1") if args.proxy else 0
+        proxy_enabled = bool(args.proxy or getattr(args, "proxy_port", None))
+        proxy_port = args.proxy_port or (choose_proxy_port(session, "127.0.0.1") if proxy_enabled else 0)
+        auth_user, auth_hash, generated_password = configure_proxy_auth(session, args, generate_if_missing=proxy_enabled and bool(args.generate_auth))
         session = SessionConfig(
             **{
                 **session.__dict__,
                 "mode": "local",
                 "ttyd_bind_host": "127.0.0.1",
                 "api_bind_host": "127.0.0.1",
-                "proxy_enabled": bool(args.proxy),
+                "proxy_enabled": proxy_enabled,
                 "proxy_port": proxy_port,
                 "proxy_bind_host": "127.0.0.1",
-                "api_base": "origin" if args.proxy else "index",
+                "api_base": "origin" if proxy_enabled else "index",
                 "public_url": "",
+                "auth_username": auth_user if proxy_enabled else session.auth_username,
+                "auth_password_hash": auth_hash if proxy_enabled else session.auth_password_hash,
             }
         )
         write_session(session)
         ensure_mobile_index(session)
+        if generated_password:
+            maybe_write_generated_env(auth_user, generated_password)
         print(session_url(session))
         return
     if args.kind == "tailscale":
-        dns_name = tailscale_dns_name()
+        dns_name = args.hostname or tailscale_dns_name()
         ip_addr = tailscale_ip()
-        if args.serve:
+        wants_proxy = bool(args.serve or args.proxy_port or args.auth_user or args.auth_password or args.auth_password_env)
+        if args.serve or wants_proxy:
             if not command_exists("tailscale"):
                 die("tailscale command not found")
-            proxy_port = session.proxy_port or choose_proxy_port(session, "127.0.0.1")
+            proxy_bind = "127.0.0.1" if args.serve else (ip_addr or "127.0.0.1")
+            proxy_port = args.proxy_port or session.proxy_port or choose_proxy_port(session, proxy_bind)
+            auth_user, auth_hash, generated_password = configure_proxy_auth(
+                session,
+                args,
+                generate_if_missing=bool(args.generate_auth),
+            )
+            public_url = ""
+            if args.serve and dns_name:
+                public_url = f"https://{dns_name}"
+            elif dns_name:
+                public_url = f"http://{dns_name}:{proxy_port}/"
             session = SessionConfig(
                 **{
                     **session.__dict__,
@@ -650,14 +893,19 @@ def cmd_deploy(args: argparse.Namespace) -> None:
                     "api_bind_host": "127.0.0.1",
                     "proxy_enabled": True,
                     "proxy_port": proxy_port,
-                    "proxy_bind_host": "127.0.0.1",
+                    "proxy_bind_host": proxy_bind,
                     "api_base": "origin",
-                    "public_url": f"https://{dns_name}" if dns_name else "",
+                    "public_url": public_url,
+                    "auth_username": auth_user,
+                    "auth_password_hash": auth_hash,
                 }
             )
             write_session(session)
             ensure_mobile_index(session)
-            run(["tailscale", "serve", "--bg", "--yes", f"http://127.0.0.1:{proxy_port}"], check=False)
+            if generated_password:
+                maybe_write_generated_env(auth_user, generated_password)
+            if args.serve:
+                run(["tailscale", "serve", "--bg", "--yes", f"http://127.0.0.1:{proxy_port}"], check=False)
         else:
             bind = ip_addr or "127.0.0.1"
             session = SessionConfig(
@@ -684,13 +932,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     if args.kind == "cloudflare":
         if not args.hostname or not args.tunnel:
             die("cloudflare deployment requires --hostname and --tunnel")
-        proxy_port = session.proxy_port or choose_proxy_port(session, "127.0.0.1")
-        auth_user = session.auth_username or "phonecodex"
-        auth_hash = session.auth_password_hash
-        generated_password = ""
-        if not auth_hash:
-            generated_password = secrets.token_urlsafe(18)
-            auth_hash = hash_password(generated_password)
+        proxy_port = args.proxy_port or session.proxy_port or choose_proxy_port(session, "127.0.0.1")
+        auth_user, auth_hash, generated_password = configure_proxy_auth(session, args, generate_if_missing=True)
         session = SessionConfig(
             **{
                 **session.__dict__,
@@ -717,7 +960,82 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         print(f"cloudflare hostname: https://{args.hostname}")
         print(f"cloudflared config:  {Path(args.config).expanduser()}")
         if generated_password:
-            print(f"generated proxy auth: {auth_user}:{generated_password}")
+            maybe_write_generated_env(auth_user, generated_password)
+        print("restart cloudflared with: cloudflared tunnel run " + args.tunnel)
+
+
+def cmd_deploy_cloudflare_multi(args: argparse.Namespace) -> None:
+    if not args.tunnel:
+        die("cloudflare multi deployment requires --tunnel")
+    if not args.base_hostname and not args.host_pattern:
+        die("cloudflare multi deployment requires --base-hostname or --host-pattern")
+    workdir = Path(args.directory or os.getcwd()).expanduser().resolve()
+    if not workdir.is_dir():
+        die(f"directory does not exist: {workdir}")
+    if args.codex and not command_exists("codex"):
+        die("codex command not found in PATH")
+    count = int(args.count)
+    if count < 1:
+        die("--count must be at least 1")
+    config_path = Path(args.config).expanduser()
+    sessions: list[SessionConfig] = []
+    for idx in range(1, count + 1):
+        name = multi_session_name(args.session_prefix, idx)
+        hostname = hostname_for_session(args.host_pattern or "", args.base_hostname or "", idx)
+        existing = read_session(name) if session_path(name).exists() else None
+        port = (args.start_port + idx - 1) if args.start_port else choose_port(existing, "127.0.0.1")
+        proxy_port = (args.start_proxy_port + idx - 1) if args.start_proxy_port else choose_proxy_port(existing, "127.0.0.1")
+        auth_user, auth_hash, generated_password = configure_proxy_auth(
+            existing
+            or SessionConfig(
+                name=name,
+                port=port,
+                title=f"{name} codex" if args.codex else name,
+                tmux_session=name,
+                workdir=str(workdir),
+                index_port=args.index_port,
+            ),
+            args,
+            generate_if_missing=True,
+        )
+        if generated_password:
+            maybe_write_generated_env(auth_user, generated_password)
+        session = SessionConfig(
+            name=name,
+            port=port,
+            title=f"{name} codex" if args.codex else name,
+            tmux_session=name,
+            workdir=str(workdir),
+            index_port=args.index_port,
+            mode="cloudflare",
+            ttyd_bind_host="127.0.0.1",
+            api_bind_host="127.0.0.1",
+            proxy_enabled=True,
+            proxy_port=proxy_port,
+            proxy_bind_host="127.0.0.1",
+            api_base="origin",
+            public_url=f"https://{hostname}",
+            auth_username=auth_user,
+            auth_password_hash=auth_hash,
+            cloudflare_tunnel=args.tunnel,
+            cloudflare_hostname=hostname,
+            cloudflare_config=str(config_path),
+        )
+        write_session(session)
+        ensure_mobile_index(session)
+        patch_cloudflared_config(config_path, hostname, f"http://127.0.0.1:{proxy_port}")
+        if not args.no_tmux:
+            ensure_tmux_session(name, workdir, "codex" if args.codex else "")
+        if not args.no_start:
+            start_index_service(session.index_port, session.mode, session.api_bind_host)
+            start_session_service(session)
+        if args.route_dns:
+            run(["cloudflared", "tunnel", "route", "dns", args.tunnel, hostname], check=False)
+        sessions.append(session)
+    for session in sessions:
+        print(f"{session.name:18} {session_url(session)}  ttyd={session.port} proxy={session.proxy_port}")
+    print(f"cloudflared config: {config_path}")
+    print("restart cloudflared with: cloudflared tunnel run " + args.tunnel)
 
 
 def cmd_service(args: argparse.Namespace) -> None:
@@ -752,6 +1070,7 @@ def add_session_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--public-url")
     parser.add_argument("--auth-user")
     parser.add_argument("--auth-password")
+    parser.add_argument("--auth-password-env")
     parser.add_argument("--cloudflare-tunnel")
     parser.add_argument("--cloudflare-hostname")
     parser.add_argument("--cloudflare-config")
@@ -792,9 +1111,10 @@ def build_parser() -> argparse.ArgumentParser:
     url.set_defaults(func=cmd_url)
 
     verify = sub.add_parser("verify", help="verify toolbar/index/proxy generation for a session")
-    verify.add_argument("name")
+    verify.add_argument("name", nargs="?")
     verify.add_argument("--skip-network", action="store_true")
     verify.add_argument("--auth-password", help="password for authenticated proxy network checks")
+    verify.add_argument("--local-test", action="store_true", help="run a full temporary tmux/ttyd/proxy integration test")
     verify.set_defaults(func=cmd_verify)
 
     attach = sub.add_parser("attach", help="attach to a configured tmux session")
@@ -811,6 +1131,30 @@ def build_parser() -> argparse.ArgumentParser:
     run_proxy.add_argument("--bind-host")
     run_proxy.add_argument("--port", type=int)
     run_proxy.set_defaults(func=cmd_run_proxy)
+
+    proxy = sub.add_parser("proxy", help="configure, run, install, or verify a session proxy")
+    proxy_sub = proxy.add_subparsers(dest="proxy_command", required=True)
+    proxy_run = proxy_sub.add_parser("run", help="configure then run a local authenticated proxy")
+    proxy_run.add_argument("name")
+    proxy_run.add_argument("--bind-host")
+    proxy_run.add_argument("--proxy-port", type=int)
+    proxy_run.add_argument("--auth-user")
+    proxy_run.add_argument("--auth-password")
+    proxy_run.add_argument("--auth-password-env")
+    proxy_run.set_defaults(func=cmd_proxy_run)
+    proxy_install = proxy_sub.add_parser("install-service", help="configure proxy and install/start native services")
+    proxy_install.add_argument("name")
+    proxy_install.add_argument("--proxy-port", type=int)
+    proxy_install.add_argument("--auth-user")
+    proxy_install.add_argument("--auth-password")
+    proxy_install.add_argument("--auth-password-env")
+    proxy_install.add_argument("--generate-auth", action="store_true")
+    proxy_install.set_defaults(func=cmd_proxy_install_service)
+    proxy_verify = proxy_sub.add_parser("verify", help="verify a proxied session")
+    proxy_verify.add_argument("name")
+    proxy_verify.add_argument("--skip-network", action="store_true")
+    proxy_verify.add_argument("--auth-password")
+    proxy_verify.set_defaults(func=cmd_proxy_verify)
 
     wrapper = sub.add_parser("tmux-wrapper", help="attach tmux; used by ttyd")
     wrapper.add_argument("name")
@@ -832,6 +1176,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check required local tools and deployment state")
     doctor.set_defaults(func=cmd_doctor)
 
+    auth = sub.add_parser("auth", help="manage PhoneCodex proxy auth env file")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    auth_init = auth_sub.add_parser("init", help="create ~/.config/phonecodex/env with chmod 600")
+    auth_init.add_argument("--user", default="phonecodex")
+    auth_init.add_argument("--auth-password")
+    auth_init.add_argument("--auth-password-env")
+    auth_init.add_argument("--generate", action="store_true")
+    auth_init.add_argument("--force", action="store_true")
+    auth_init.set_defaults(func=cmd_auth)
+
     service = sub.add_parser("service", help="install/start/stop/restart/status/logs native services")
     service.add_argument("action", choices=["install", "start", "stop", "restart", "status", "logs"])
     service.add_argument("name", nargs="?")
@@ -846,17 +1200,43 @@ def build_parser() -> argparse.ArgumentParser:
     local = deploy_sub.add_parser("local")
     local.add_argument("name")
     local.add_argument("--proxy", action="store_true")
+    local.add_argument("--proxy-port", type=int)
+    local.add_argument("--auth-user")
+    local.add_argument("--auth-password")
+    local.add_argument("--auth-password-env")
+    local.add_argument("--generate-auth", action="store_true")
     local.set_defaults(func=cmd_deploy)
     tailscale = deploy_sub.add_parser("tailscale")
     tailscale.add_argument("name")
+    tailscale.add_argument("--hostname")
+    tailscale.add_argument("--proxy-port", type=int)
+    tailscale.add_argument("--auth-user")
+    tailscale.add_argument("--auth-password")
+    tailscale.add_argument("--auth-password-env")
+    tailscale.add_argument("--generate-auth", action="store_true")
     tailscale.add_argument("--serve", action="store_true")
     tailscale.set_defaults(func=cmd_deploy)
     cloudflare = deploy_sub.add_parser("cloudflare")
     cloudflare.add_argument("name")
-    cloudflare.add_argument("--hostname", required=True)
+    cloudflare.add_argument("--hostname")
     cloudflare.add_argument("--tunnel", required=True)
-    cloudflare.add_argument("--config", default=str(Path.home() / ".cloudflared" / "config.yml"))
+    cloudflare.add_argument("--config", "--cloudflared-config", default=str(Path.home() / ".cloudflared" / "config.yml"))
+    cloudflare.add_argument("--proxy-port", type=int)
+    cloudflare.add_argument("--auth-user")
+    cloudflare.add_argument("--auth-password")
+    cloudflare.add_argument("--auth-password-env")
     cloudflare.add_argument("--route-dns", action="store_true")
+    cloudflare.add_argument("--base-hostname")
+    cloudflare.add_argument("--count", type=int, default=1)
+    cloudflare.add_argument("--start-port", type=int)
+    cloudflare.add_argument("--start-proxy-port", type=int)
+    cloudflare.add_argument("--host-pattern")
+    cloudflare.add_argument("--session-prefix", default="phonecodex")
+    cloudflare.add_argument("--directory")
+    cloudflare.add_argument("--index-port", type=int, default=DEFAULT_INDEX_PORT)
+    cloudflare.add_argument("--codex", action="store_true")
+    cloudflare.add_argument("--no-start", action="store_true")
+    cloudflare.add_argument("--no-tmux", action="store_true")
     cloudflare.set_defaults(func=cmd_deploy)
 
     return parser
